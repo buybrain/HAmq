@@ -1,50 +1,48 @@
 package io.buybrain.hamq;
 
 import com.rabbitmq.client.ShutdownSignalException;
+import io.buybrain.util.Result;
 import io.buybrain.util.function.ThrowingRunnable;
 import io.buybrain.util.function.ThrowingSupplier;
+import io.buybrain.util.time.Clock;
+import io.buybrain.util.time.SystemClock;
 import lombok.NonNull;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import lombok.val;
 
 import java.net.SocketException;
 
-import static io.buybrain.util.Exceptions.rethrow;
-import static io.buybrain.util.Exceptions.rethrowR;
+import static io.buybrain.util.Result.err;
+import static io.buybrain.util.Result.trying;
 
 /**
  * Utility for retrying operations until they succeed while applying exponential backoff between attempts
  */
 @Slf4j
 class Retryer {
-    static void performWithRetry(@NonNull ThrowingRunnable operation, @NonNull RetryPolicy policy) {
+    @Setter private Clock clock = SystemClock.get();
+    
+    void performWithRetry(@NonNull ThrowingRunnable operation, @NonNull RetryPolicy policy) {
         val state = new RetryState();
-        rethrow(() -> {
-            while (true) {
-                try {
-                    operation.run();
-                    return;
-                } catch (Exception ex) {
-                    handleError(ex, policy, state);
-                }
+        while (true) {
+            if (trying(operation).mapErr(ex -> handleError(ex, policy, state)).isOk()) {
+                return;
             }
-        });
+        }
     }
 
-    static <T> T performWithRetry(@NonNull ThrowingSupplier<T> operation, @NonNull RetryPolicy policy) {
+    <T> T performWithRetry(@NonNull ThrowingSupplier<T> operation, @NonNull RetryPolicy policy) {
         val state = new RetryState();
-        return rethrowR(() -> {
-            while (true) {
-                try {
-                    return operation.get();
-                } catch (Exception ex) {
-                    handleError(ex, policy, state);
-                }
+        while (true) {
+            Result<T, ?> result = trying(operation).mapErr(ex -> handleError(ex, policy, state));
+            if (result.isOk()) {
+                return result.getUnsafe();
             }
-        });
+        }
     }
 
-    private static void handleError(Exception ex, RetryPolicy policy, RetryState state) throws Exception {
+    private Result handleError(Throwable ex, RetryPolicy policy, RetryState state) throws Throwable {
         if (isRetryable(ex, policy)) {
             log.warn("Encountered error, will retry later", ex);
             if (policy.getErrorHandler() != null) {
@@ -53,17 +51,19 @@ class Retryer {
             if (state.delayMillis == 0) {
                 state.delayMillis = policy.getInitialDelay().toMillis();
             }
+            
             Thread.sleep(state.delayMillis);
             state.delayMillis = Math.min(
                 (long) (state.delayMillis * policy.getDelayMultiplier()),
                 policy.getMaxDelay().toMillis()
             );
+            return err(ex);
         } else {
             throw ex;
         }
     }
 
-    private static boolean isRetryable(Throwable ex, RetryPolicy policy) {
+    private boolean isRetryable(Throwable ex, RetryPolicy policy) {
         return policy.isRetryAll() || isNetworkError(ex);
     }
 

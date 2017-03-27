@@ -1,9 +1,10 @@
 package io.buybrain.hamq;
 
+import io.buybrain.util.time.Clock;
 import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
 
-import static io.buybrain.hamq.Retryer.performWithRetry;
+import static io.buybrain.util.Result.trying;
 
 /**
  * HAmq connection representation
@@ -13,6 +14,16 @@ public class Connection {
     @NonNull private final Config config;
     @NonNull private final Backend backend;
     private BackendConnection connection;
+    private Retryer retryer = new Retryer();
+
+    /**
+     * Set the clock implementation for this connection. Useful for testing.
+     * 
+     * @param clock the new clock
+     */
+    public void setClock(@NonNull Clock clock) {
+        retryer.setClock(clock);
+    }
 
     /**
      * Create a new AMQP channel.
@@ -20,7 +31,7 @@ public class Connection {
      * @return the channel
      */
     public Channel createChannel() {
-        return new Channel(this);
+        return new Channel(this, retryer);
     }
 
     /**
@@ -39,7 +50,7 @@ public class Connection {
      */
     synchronized BackendConnection activeConnection() {
         if (connection == null) {
-            connection = performWithRetry(
+            connection = retryer.performWithRetry(
                 () -> backend.newConnection(config),
                 new RetryPolicy().withRetryAll(true)
             );
@@ -53,10 +64,7 @@ public class Connection {
      */
     synchronized void reset() {
         if (connection != null) {
-            try {
-                connection.close();
-            } catch (Exception ignored) {
-            }
+            trying(connection::close);
         }
         connection = null;
     }

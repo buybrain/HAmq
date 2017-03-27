@@ -16,7 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import static io.buybrain.hamq.Retryer.performWithRetry;
+import static io.buybrain.util.Result.trying;
 
 /**
  * HAmq channel representation. All methods will be automatically retried in case of network or broker failures until
@@ -26,6 +26,7 @@ import static io.buybrain.hamq.Retryer.performWithRetry;
 @RequiredArgsConstructor
 public class Channel {
     @NonNull private final Connection connection;
+    @NonNull private final Retryer retryer;
     private BackendChannel channel;
 
     private static AtomicInteger tagCounter = new AtomicInteger();
@@ -157,20 +158,16 @@ public class Channel {
                     Envelope envelope,
                     AMQP.BasicProperties properties,
                     byte[] body
-                ) throws IOException {
-                    try {
-                        spec.getCallback().accept(new Delivery(chan, envelope, properties, body));
-                    } catch (Exception ex) {
-                        // Processing the delivery failed, which means that acking or nacking must have failed since
-                        // consumer callbacks are supposed to deal with their own internal errors. We have to clean
-                        // up this channel and connection and retry consuming.
-                        try {
-                            chan.basicCancel(consumerTag);
-                        } catch (Exception ignored) {
-                        }
-                        log.warn("Error while (n)acking delivery, will retry consuming");
-                        reset();
-                    }
+                ) {
+                    trying(() -> spec.getCallback().accept(new Delivery(chan, envelope, properties, body)))
+                        .orElse(ex -> {
+                            // Processing the delivery failed, which means that acking or nacking must have failed since
+                            // consumer callbacks are supposed to deal with their own internal errors. We have to clean
+                            // up this channel and connection and retry consuming.
+                            trying(() -> chan.basicCancel(consumerTag));
+                            log.warn("Error while (n)acking delivery, will retry consuming", ex);
+                            reset();
+                        });
                 }
             }
         ), spec);
@@ -181,7 +178,7 @@ public class Channel {
      * Try to perform an operation on the channel, retrying it if necessary
      */
     private void perform(ThrowingConsumer<BackendChannel> operation, OperationSpec spec) {
-        performWithRetry(
+        retryer.performWithRetry(
             () -> operation.accept(activeChannel()),
             getRetryPolicy(spec).withErrorHandler(ex -> {
                 if (Retryer.shouldReconnectToRecover(ex)) {
@@ -200,7 +197,7 @@ public class Channel {
 
     private synchronized BackendChannel activeChannel() {
         if (channel == null) {
-            channel = performWithRetry(
+            channel = retryer.performWithRetry(
                 () -> connection.activeConnection().newChannel(),
                 new RetryPolicy().withRetryAll(true)
             );
@@ -210,17 +207,8 @@ public class Channel {
 
     private synchronized void reset() {
         if (channel != null) {
-            consumers.keySet().forEach(tag -> {
-                try {
-                    channel.basicCancel(tag);
-                } catch (Exception ignored) {
-                }
-            });
-
-            try {
-                channel.close();
-            } catch (Exception ignored) {
-            }
+            consumers.keySet().forEach(tag -> trying(() -> channel.basicCancel(tag)));
+            trying(channel::close);
         }
         channel = null;
         connection.reset();
