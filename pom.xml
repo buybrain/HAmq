@@ -76,7 +76,7 @@
         <dependency>
             <groupId>io.buybrain</groupId>
             <artifactId>util</artifactId>
-            <version>0.0.3</version>
+            <version>0.0.4</version>
         </dependency>
 
         <!-- https://mvnrepository.com/artifact/org.mockito/mockito-all -->
