@@ -2,6 +2,7 @@ package io.buybrain.hamq;
 
 import com.rabbitmq.client.AMQP;
 import com.rabbitmq.client.Consumer;
+import lombok.NonNull;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -25,6 +26,13 @@ interface BackendChannel extends Closeable {
         boolean durable,
         boolean exclusive,
         boolean autoDelete,
+        Map<String, Object> arguments
+    ) throws IOException;
+
+    void queueBind(
+        String queue,
+        String exchange,
+        String routingKey,
         Map<String, Object> arguments
     ) throws IOException;
 

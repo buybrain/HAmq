@@ -35,6 +35,7 @@ public class Channel {
     // after reconnect events
     private List<ExchangeSpec> exchanges = new ArrayList<>();
     private List<QueueSpec> queues = new ArrayList<>();
+    private List<BindSpec> binds = new ArrayList<>();
     private Map<String, ConsumeSpec> consumers = new HashMap<>();
     private PrefetchSpec prefetchSpec;
 
@@ -77,6 +78,26 @@ public class Channel {
             spec.isDurable(),
             spec.isExclusive(),
             spec.isAutoDelete(),
+            spec.getArgs()
+        ), spec);
+    }
+
+    /**
+     * Bind a queue to an exchange. Will create a new binding if it doesn't exist, or do nothing if the binding already
+     * exists with the same settings.
+     *
+     * @param spec the bind specification
+     */
+    public synchronized void queueBind(@NonNull BindSpec spec) {
+        doQueueBind(spec);
+        binds.add(spec);
+    }
+
+    private void doQueueBind(@NonNull BindSpec spec) {
+        perform(chan -> chan.queueBind(
+            spec.getQueue(),
+            spec.getExchange(),
+            spec.getRoutingKey(),
             spec.getArgs()
         ), spec);
     }
@@ -216,9 +237,10 @@ public class Channel {
         // Restore state
         exchanges.forEach(this::doExchangeDeclare);
         queues.forEach(this::doQueueDeclare);
+        binds.forEach(this::doQueueBind);
         if (prefetchSpec != null) {
             doPrefetch(prefetchSpec);
         }
-        consumers.entrySet().forEach(entry -> doConsume(entry.getKey(), entry.getValue()));
+        consumers.forEach(this::doConsume);
     }
 }

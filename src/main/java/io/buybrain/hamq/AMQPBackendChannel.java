@@ -42,6 +42,16 @@ class AMQPBackendChannel implements BackendChannel {
     }
 
     @Override
+    public void queueBind(
+        @NonNull String queue,
+        @NonNull String exchange,
+        @NonNull String routingKey,
+        @NonNull Map<String, Object> arguments
+    ) throws IOException {
+        channel.queueBind(queue, exchange, routingKey, arguments);
+    }
+
+    @Override
     public void basicQos(int prefetch) throws IOException {
         channel.basicQos(prefetch);
     }
