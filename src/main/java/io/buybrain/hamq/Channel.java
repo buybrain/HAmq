@@ -6,6 +6,7 @@ import com.rabbitmq.client.ShutdownSignalException;
 import io.buybrain.util.function.ThrowingConsumer;
 import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import lombok.val;
 
@@ -14,7 +15,13 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static io.buybrain.util.Result.trying;
 
@@ -29,15 +36,20 @@ public class Channel {
     @NonNull private final Retryer retryer;
     private BackendChannel channel;
 
-    private static AtomicInteger tagCounter = new AtomicInteger();
+    private static final AtomicInteger tagCounter = new AtomicInteger();
 
     // The following fields capture the state created through this channel, and will be used for recreating channels
     // after reconnect events
-    private List<ExchangeSpec> exchanges = new ArrayList<>();
-    private List<QueueSpec> queues = new ArrayList<>();
-    private List<BindSpec> binds = new ArrayList<>();
-    private Map<String, ConsumeSpec> consumers = new HashMap<>();
+    private final List<ExchangeSpec> exchanges = new ArrayList<>();
+    private final List<QueueSpec> queues = new ArrayList<>();
+    private final List<BindSpec> binds = new ArrayList<>();
+    private final Map<String, ConsumeSpec> consumers = new HashMap<>();
     private PrefetchSpec prefetchSpec;
+
+    private final Lock getChannelLock = new ReentrantLock();
+    private final ExecutorService consumeHandlerExecutor = Executors.newSingleThreadExecutor();
+    private Future currentConsumeHandler = null;
+    private final ExecutorService resetExecutor = Executors.newSingleThreadExecutor();
 
     /**
      * Declare an exchange. Will create the exchange if it doesn't exist, or do nothing if it already exists with the
@@ -174,26 +186,50 @@ public class Channel {
                 }
 
                 @Override
+                @SneakyThrows
                 public void handleDelivery(
                     String consumerTag,
                     Envelope envelope,
                     AMQP.BasicProperties properties,
                     byte[] body
                 ) {
-                    trying(() -> spec.getCallback().accept(new Delivery(chan, envelope, properties, body)))
-                        .orElse(ex -> {
-                            // Processing the delivery failed, which means that acking or nacking must have failed since
-                            // consumer callbacks are supposed to deal with their own internal errors. We have to clean
-                            // up this channel and connection and retry consuming.
-                            trying(() -> chan.basicCancel(consumerTag));
-                            log.warn("Error while (n)acking delivery, will retry consuming", ex);
-                            reset();
+                    // Run the message handling in a separate thread which can be killed in case of a recovery reset
+                    synchronized (consumeHandlerExecutor) {
+                        currentConsumeHandler = consumeHandlerExecutor.submit(() -> {
+                            trying(() -> spec.getCallback().accept(new Delivery(chan, envelope, properties, body)))
+                                .orElse(ex -> {
+                                    if (isInterruptedException(ex)) {
+                                        // This thread is being cleaned up, so we should just return
+                                        return;
+                                    }
+                                    // Processing the delivery failed, which means that acking or nacking must have failed
+                                    // since consumer callbacks are supposed to deal with their own internal errors. We have
+                                    // to clean up this channel and connection and retry consuming.
+                                    trying(() -> chan.basicCancel(consumerTag));
+                                    log.warn("Error while (n)acking delivery, will retry consuming", ex);
+                                    reset();
+                                });
                         });
+                        try {
+                            currentConsumeHandler.get();
+                        } catch (CancellationException ignored) {
+                        }
+                        currentConsumeHandler = null;
+                    }
                 }
             }
         ), spec);
     }
 
+    private boolean isInterruptedException(Throwable ex) {
+        if (ex instanceof InterruptedException) {
+            return true;
+        }
+        if (ex.getCause() != null && ex.getCause() != ex) {
+            return isInterruptedException(ex.getCause());
+        }
+        return false;
+    }
 
     /**
      * Try to perform an operation on the channel, retrying it if necessary
@@ -216,31 +252,45 @@ public class Channel {
         return connection.getRetryPolicy();
     }
 
-    private synchronized BackendChannel activeChannel() {
+    private BackendChannel activeChannel() {
+        getChannelLock.lock();
         if (channel == null) {
             channel = retryer.performWithRetry(
                 () -> connection.activeConnection().newChannel(),
                 new RetryPolicy().withRetryAll(true)
             );
         }
+        getChannelLock.unlock();
         return channel;
     }
 
-    private synchronized void reset() {
-        if (channel != null) {
-            consumers.keySet().forEach(tag -> trying(() -> channel.basicCancel(tag)));
-            trying(channel::close);
-        }
-        channel = null;
-        connection.reset();
+    @SneakyThrows
+    private void reset() {
+        // Run the reset logic in a separate thread to prevent the reset routine from being interrupted if the calling
+        // thread is a consumer that gets killed.
+        resetExecutor.submit(() -> {
+            // Kill the current consume handler thread if any
+            if (currentConsumeHandler != null) {
+                currentConsumeHandler.cancel(true);
+            }
 
-        // Restore state
-        exchanges.forEach(this::doExchangeDeclare);
-        queues.forEach(this::doQueueDeclare);
-        binds.forEach(this::doQueueBind);
-        if (prefetchSpec != null) {
-            doPrefetch(prefetchSpec);
-        }
-        consumers.forEach(this::doConsume);
+            // Cancel consumers and close the current channel
+            if (channel != null) {
+                consumers.keySet().forEach(tag -> trying(() -> channel.basicCancel(tag)));
+                trying(channel::close);
+            }
+            channel = null;
+            // Reset the connection
+            connection.reset();
+
+            // Restore state
+            exchanges.forEach(this::doExchangeDeclare);
+            queues.forEach(this::doQueueDeclare);
+            binds.forEach(this::doQueueBind);
+            if (prefetchSpec != null) {
+                doPrefetch(prefetchSpec);
+            }
+            consumers.forEach(this::doConsume);
+        }).get();
     }
 }
