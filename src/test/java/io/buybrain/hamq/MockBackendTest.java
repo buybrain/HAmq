@@ -1,7 +1,9 @@
 package io.buybrain.hamq;
 
+import com.rabbitmq.client.AlreadyClosedException;
 import com.rabbitmq.client.Consumer;
 import com.rabbitmq.client.Envelope;
+import com.rabbitmq.client.ShutdownSignalException;
 import lombok.val;
 import org.mockito.stubbing.Answer;
 import org.testng.annotations.BeforeMethod;
@@ -100,6 +102,12 @@ public class MockBackendTest {
             return null;
         };
 
+        doThrow(new AlreadyClosedException(mock(ShutdownSignalException.class)))
+            .when(backendChan).basicAck(1L);
+
+        doThrow(new AlreadyClosedException(mock(ShutdownSignalException.class)))
+            .when(backendChan).basicNack(anyLong());
+
         doAnswer(answerWithDeliveryTag.apply(1L))
             .doAnswer(answerWithDeliveryTag.apply(2L))
             .when(backendChan).basicConsume(eq("source"), anyString(), anyBoolean(), anyBoolean(), anyMap(), any());
@@ -113,11 +121,16 @@ public class MockBackendTest {
 
         ch.consume(new ConsumeSpec("source", delivery -> {
             // Multiply the body by 10 and publish the result
-            ch.publish(new PublishSpec(
-                "",
-                "target",
-                Integer.toString(parseInt(delivery.getBodyAsString()) * 10).getBytes()
-            ));
+            try {
+                ch.publish(new PublishSpec(
+                    "",
+                    "target",
+                    Integer.toString(parseInt(delivery.getBodyAsString()) * 10).getBytes()
+                ));
+            } catch (Exception ex) {
+                delivery.nack();
+                return;
+            }
             delivery.ack();
         }));
 

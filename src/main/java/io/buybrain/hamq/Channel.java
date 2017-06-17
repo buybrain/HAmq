@@ -15,10 +15,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CancellationException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -47,9 +43,6 @@ public class Channel {
     private PrefetchSpec prefetchSpec;
 
     private final Lock getChannelLock = new ReentrantLock();
-    private final ExecutorService consumeHandlerExecutor = Executors.newSingleThreadExecutor();
-    private Future currentConsumeHandler = null;
-    private final ExecutorService resetExecutor = Executors.newSingleThreadExecutor();
 
     /**
      * Declare an exchange. Will create the exchange if it doesn't exist, or do nothing if it already exists with the
@@ -178,7 +171,7 @@ public class Channel {
 
                 @Override
                 public void handleShutdownSignal(String consumerTag, ShutdownSignalException sig) {
-                    reset();
+                    reset(chan);
                 }
 
                 @Override
@@ -193,42 +186,18 @@ public class Channel {
                     AMQP.BasicProperties properties,
                     byte[] body
                 ) {
-                    // Run the message handling in a separate thread which can be killed in case of a recovery reset
-                    synchronized (consumeHandlerExecutor) {
-                        currentConsumeHandler = consumeHandlerExecutor.submit(() -> {
-                            trying(() -> spec.getCallback().accept(new Delivery(chan, envelope, properties, body)))
-                                .orElse(ex -> {
-                                    if (isInterruptedException(ex)) {
-                                        // This thread is being cleaned up, so we should just return
-                                        return;
-                                    }
-                                    // Processing the delivery failed, which means that acking or nacking must have failed
-                                    // since consumer callbacks are supposed to deal with their own internal errors. We have
-                                    // to clean up this channel and connection and retry consuming.
-                                    trying(() -> chan.basicCancel(consumerTag));
-                                    log.warn("Error while (n)acking delivery, will retry consuming", ex);
-                                    reset();
-                                });
+                    trying(() -> spec.getCallback().accept(new Delivery(chan, envelope, properties, body)))
+                        .orElse(ex -> {
+                            // Processing the delivery failed, which means that acking or nacking must have failed
+                            // since consumer callbacks are supposed to deal with their own internal errors. We have
+                            // to clean up this channel and connection and retry consuming.
+                            trying(() -> chan.basicCancel(consumerTag));
+                            log.warn("Error while (n)acking delivery, will retry consuming", ex);
+                            reset(chan);
                         });
-                        try {
-                            currentConsumeHandler.get();
-                        } catch (CancellationException ignored) {
-                        }
-                        currentConsumeHandler = null;
-                    }
                 }
             }
         ), spec);
-    }
-
-    private boolean isInterruptedException(Throwable ex) {
-        if (ex instanceof InterruptedException) {
-            return true;
-        }
-        if (ex.getCause() != null && ex.getCause() != ex) {
-            return isInterruptedException(ex.getCause());
-        }
-        return false;
     }
 
     /**
@@ -239,7 +208,7 @@ public class Channel {
             () -> operation.accept(activeChannel()),
             getRetryPolicy(spec).withErrorHandler(ex -> {
                 if (Retryer.shouldReconnectToRecover(ex)) {
-                    reset();
+                    reset(null);
                 }
             })
         );
@@ -265,32 +234,29 @@ public class Channel {
     }
 
     @SneakyThrows
-    private void reset() {
-        // Run the reset logic in a separate thread to prevent the reset routine from being interrupted if the calling
-        // thread is a consumer that gets killed.
-        resetExecutor.submit(() -> {
-            // Kill the current consume handler thread if any
-            if (currentConsumeHandler != null) {
-                currentConsumeHandler.cancel(true);
-            }
+    private void reset(BackendChannel errorChan) {
+        if (channel != null && errorChan != null && channel != errorChan) {
+            // The channel on which the error occurred is not the same as the current active channel, which means that
+            // we got an error on an old, already closed/reset channel. This can happen in consumers where message
+            // acknowledgement fails because the connection and channel were already reset.
+            return;
+        }
+        // Cancel consumers and close the current channel
+        if (channel != null) {
+            consumers.keySet().forEach(tag -> trying(() -> channel.basicCancel(tag)));
+            trying(channel::close);
+        }
+        // Reset the connection
+        connection.reset();
+        channel = null;
 
-            // Cancel consumers and close the current channel
-            if (channel != null) {
-                consumers.keySet().forEach(tag -> trying(() -> channel.basicCancel(tag)));
-                trying(channel::close);
-            }
-            channel = null;
-            // Reset the connection
-            connection.reset();
-
-            // Restore state
-            exchanges.forEach(this::doExchangeDeclare);
-            queues.forEach(this::doQueueDeclare);
-            binds.forEach(this::doQueueBind);
-            if (prefetchSpec != null) {
-                doPrefetch(prefetchSpec);
-            }
-            consumers.forEach(this::doConsume);
-        }).get();
+        // Restore state
+        exchanges.forEach(this::doExchangeDeclare);
+        queues.forEach(this::doQueueDeclare);
+        binds.forEach(this::doQueueBind);
+        if (prefetchSpec != null) {
+            doPrefetch(prefetchSpec);
+        }
+        consumers.forEach(this::doConsume);
     }
 }
