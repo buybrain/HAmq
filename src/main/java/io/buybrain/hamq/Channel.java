@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -150,6 +151,8 @@ public class Channel {
     }
 
     private void doConsume(@NonNull String consumerTag, @NonNull ConsumeSpec spec) {
+        val closed = new AtomicBoolean(false);
+
         perform(chan -> chan.basicConsume(
             spec.getQueue(),
             consumerTag,
@@ -171,6 +174,7 @@ public class Channel {
 
                 @Override
                 public void handleShutdownSignal(String consumerTag, ShutdownSignalException sig) {
+                    closed.set(true);
                     reset(chan);
                 }
 
@@ -186,6 +190,9 @@ public class Channel {
                     AMQP.BasicProperties properties,
                     byte[] body
                 ) {
+                    if (closed.get()) {
+                        throw new RuntimeException("Consumer is closed");
+                    }
                     trying(() -> spec.getCallback().accept(new Delivery(chan, envelope, properties, body)))
                         .orElse(ex -> {
                             // Processing the delivery failed, which means that acking or nacking must have failed
@@ -193,6 +200,7 @@ public class Channel {
                             // to clean up this channel and connection and retry consuming.
                             trying(() -> chan.basicCancel(consumerTag));
                             log.warn("Error while (n)acking delivery, will retry consuming", ex);
+                            closed.set(true);
                             reset(chan);
                         });
                 }

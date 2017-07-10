@@ -1,6 +1,7 @@
 package io.buybrain.hamq;
 
 import com.rabbitmq.client.ConnectionFactory;
+import com.rabbitmq.client.impl.StrictExceptionHandler;
 import lombok.NonNull;
 import lombok.val;
 
@@ -24,6 +25,7 @@ class AMQPBackend implements Backend {
         factory.setPassword(config.getPassword());
         factory.setVirtualHost(config.getVhost());
         factory.setAutomaticRecoveryEnabled(false);
+        factory.setExceptionHandler(new StrictExceptionHandler());
 
         return new AMQPBackendConnection(factory.newConnection());
     }
