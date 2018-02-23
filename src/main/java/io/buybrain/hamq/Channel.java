@@ -128,13 +128,18 @@ public class Channel {
      * @param spec the publish specification
      */
     public void publish(@NonNull PublishSpec spec) {
+        val propBuilder = new AMQP.BasicProperties.Builder()
+            .deliveryMode(spec.isDurable() ? 2 : 1);
+
+        if (!spec.getHeaders().isEmpty()) {
+            propBuilder.headers(spec.getHeaders());
+        }
+
         perform(chan -> chan.basicPublish(
             spec.getExchange(),
             spec.getRoutingKey(),
             spec.isMandatory(),
-            new AMQP.BasicProperties.Builder()
-                .deliveryMode(spec.isDurable() ? 2 : 1)
-                .build(),
+            propBuilder.build(),
             spec.getBody()
         ), spec);
     }
